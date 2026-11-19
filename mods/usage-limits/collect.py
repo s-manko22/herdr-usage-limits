@@ -57,15 +57,15 @@ def codex():
                     if not item:
                         continue
                     minutes = item.get("window_minutes") or 0
-                    label = "Неделя" if minutes == 10080 else "5 часов" if minutes == 300 else f"{minutes // 1440} дней" if minutes and minutes % 1440 == 0 else f"{minutes // 60} ч" if minutes else "Лимит"
+                    label = "week" if minutes == 10080 else "five_hours" if minutes == 300 else {"key": "days", "count": minutes // 1440} if minutes and minutes % 1440 == 0 else {"key": "hours", "count": minutes // 60} if minutes else "quota"
                     windows.append(window(label, item))
                 if windows:
                     return {"name": "Codex", "plan": (limits.get("plan_type") or "").capitalize(),
                             "at": stamp(event.get("timestamp")), "windows": windows,
-                            "source": "Последние данные Codex"}
+                            "source": "codex_source"}
             except (ValueError, AttributeError, TypeError):
                 continue
-    return {"name": "Codex", "windows": [{"label": "Лимит"}], "note": "Нет данных. Откройте сессию Codex."}
+    return {"name": "Codex", "windows": [{"label": "quota"}], "note": "codex_missing"}
 
 
 def credentials():
@@ -83,6 +83,13 @@ def credentials():
 def claude():
     now = time.time()
     cache = read_json(CACHE)
+    # Keep existing quota data and retry deadlines when upgrading the old cache.
+    error = cache.get("error")
+    if isinstance(error, str) and error not in ("claude_auth", "claude_unavailable"):
+        if error.startswith("Claude API: HTTP "):
+            cache["error"] = {"key": "claude_http", "code": error.split()[3].rstrip(".")}
+        else:
+            cache["error"] = "claude_auth" if error.startswith("Нет авторизации") else "claude_unavailable"
     profile = read_json(HOME / ".claude.json").get("oauthAccount", {})
     account = profile.get("accountUuid")
     if cache.get("account") != account:
@@ -93,7 +100,7 @@ def claude():
         try:
             token = credentials()
             if not token:
-                raise RuntimeError("Нет авторизации Claude Code; используются локальные данные.")
+                raise RuntimeError("claude_auth")
             request = urllib.request.Request("https://api.anthropic.com/api/oauth/usage", headers={
                 "Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20",
                 "User-Agent": "herdr-usage-limits/1.0"})
@@ -101,13 +108,13 @@ def claude():
                 data = json.load(response)
             cache.update(data={k: data.get(k) for k in ("five_hour", "seven_day", "thirty_day", "extra_usage")}, at=now, error=None)
         except urllib.error.HTTPError as error:
-            cache["error"] = f"Claude API: HTTP {error.code}. Используются последние данные."
+            cache["error"] = {"key": "claude_http", "code": error.code}
             if error.code == 429:
                 cache["retry"] = now + 900
         except RuntimeError as error:
             cache["error"] = str(error)
         except (OSError, ValueError, subprocess.SubprocessError):
-            cache["error"] = "Claude API недоступен. Используются последние данные."
+            cache["error"] = "claude_unavailable"
         try:
             temporary = CACHE.with_suffix(".tmp")
             temporary.write_text(json.dumps(cache))
@@ -120,21 +127,21 @@ def claude():
     if fallback.get("at", 0) > (at or 0) and not fallback.get("api"):
         data = dict(data, **{k: fallback[k] for k in ("five_hour", "seven_day") if k in fallback})
         at = fallback["at"]
-    windows = [window("5 часов", data.get("five_hour")), window("Неделя", data.get("seven_day"))]
-    monthly = window("30 дней", data.get("thirty_day"))
+    windows = [window("five_hours", data.get("five_hour")), window("week", data.get("seven_day"))]
+    monthly = window("month", data.get("thirty_day"))
     extra = data.get("extra_usage")
     if monthly.get("used") is None:
         if isinstance(extra, dict) and extra.get("is_enabled") and isinstance(extra.get("monthly_limit"), (int, float)) and extra["monthly_limit"] > 0:
             monthly["used"] = extra.get("utilization")
             if monthly["used"] is None and isinstance(extra.get("used_credits"), (int, float)):
                 monthly["used"] = extra["used_credits"] / extra["monthly_limit"] * 100
-            monthly["detail"] = "Месячный бюджет extra usage"
+            monthly["detail"] = "monthly_budget"
         else:
-            monthly["detail"] = "Claude не предоставляет лимит за 30 дней" if extra is None else "Месячный extra usage выключен"
+            monthly["detail"] = "monthly_missing" if extra is None else "monthly_disabled"
     windows.append(monthly)
     return {"name": "Claude", "plan": profile.get("planDisplayName") or profile.get("seatTier", "").replace("_", " ").title(),
             "at": at, "windows": windows, "note": cache.get("error"),
-            "source": "Claude API" if cache.get("data") else "Данные Claude Code"}
+            "source": "claude_api" if cache.get("data") else "claude_source"}
 
 
 if __name__ == "__main__":
@@ -143,5 +150,5 @@ if __name__ == "__main__":
         try:
             rows.append(collect())
         except Exception:
-            rows.append({"name": name, "windows": [], "note": "Не удалось прочитать лимиты. Нажмите «Обновить»."})
+            rows.append({"name": name, "windows": [], "note": "collect_error"})
     print(json.dumps({"services": rows}, ensure_ascii=False))
